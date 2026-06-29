@@ -1,0 +1,59 @@
+Visión artificial para detección y control de sargazo
+import cv2
+import numpy as np
+import serial
+import time
+print("Iniciando IA con fotografía y Comunicación USB hacia ESP32...")
+# 1. Configurar la comunicación serial por USB
+try:
+# Asegúrate de que el ESP32 esté realmente en /dev/ttyUSB0
+esp32 = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
+time.sleep(2)
+print("¡Conexión USB establecida con el ESP32!")
+except Exception as e:
+print(f"No se pudo abrir el puerto USB: {e}")
+esp32 = None
+# 2. Cargar la imagen de prueba
+frame = cv2.imread('sargazo.jpg')
+if frame is None:
+print("Error: No se encontró la imagen 'sargazo.jpg'.")
+else:
+frame = cv2.resize(frame, (640, 480))
+# Convertir a HSV
+hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+# 3. CORRECCIÓN: Definimos 3 valores [H, S, V]
+# Rango para sargazo (tonos café/naranja/seco)
+# H: 0-20 (Naranjas), S: 40-255, V: 40-255
+color_bajo = np.array([0, 40, 40], dtype="uint8")
+color_alto = np.array([30, 255, 255], dtype="uint8")
+# Ahora inRange no dará error porque los tamaños coinciden
+mascara = cv2.inRange(hsv, color_bajo, color_alto)
+# Limpieza de ruido (Opcional pero recomendado para el torneo)
+mascara = cv2.erode(mascara, None, iterations=2)
+mascara = cv2.dilate(mascara, None, iterations=2)
+contornos, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+if contornos:
+mancha_principal = max(contornos, key=cv2.contourArea)
+if cv2.contourArea(mancha_principal) > 500:
+x, y, ancho, alto = cv2.boundingRect(mancha_principal)
+centro_x = x + (ancho // 2)
+# 4. Calcular error matemático (Centro de imagen es 320)
+error = centro_x - 320
+# Dibujo de resultados
+cv2.rectangle(frame, (x, y), (x+ancho, y+alto), (0, 255, 0), 2)
+cv2.circle(frame, (centro_x, y + (alto//2)), 5, (0, 0, 255), -1)
+cv2.putText(frame, f"Error: {error}", (x, y-20),
+cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+# 5. ¡ENVIAR EL DATO AL ESP32!
+if esp32 is not None:
+mensaje = f"{error}\n"
+esp32.write(mensaje.encode('utf-8'))
+print(f"Dato enviado al barco: {error}")
+# Mostrar ventanas
+cv2.imshow("IA - Transmitiendo a ESP32", frame)
+cv2.imshow("Filtro Color (Mascara)", mascara)
+print("Procesamiento exitoso. Presiona cualquier tecla para salir.")
+cv2.waitKey(0)
+cv2.destroyAllWindows()
+if esp32 is not None:
+esp32.close()
