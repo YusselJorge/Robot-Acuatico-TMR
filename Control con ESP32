@@ -1,0 +1,183 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <SparkFun_BNO080_Arduino_Library.h> 
+
+// --- CONFIGURACIÓN WI-FI ---
+const char* ssid = "Robot_Acuatico_TMR";
+const char* password = "seguridad_tmr";
+WebServer servidor(80);
+
+BNO080 imu;
+Servo escMotorDerecho;
+Servo escMotorIzquierdo;
+
+const int PIN_MOTOR_D = 32; 
+const int PIN_MOTOR_I = 33; 
+const int BNO085_INT = 4;     
+const int BNO085_RST = 5;
+
+bool sistemaActivo = false;
+float error_camara = 0.0;
+float area_sargazo = 0.0;
+unsigned long ultimo_dato_camara = 0;
+float yaw_actual = 0.0;
+float setpoint_yaw = 0.0; 
+unsigned long tiempoAnteriorPID = 0;
+
+// --- VARIABLES DE "SPRINT" (RECOLECCIÓN) ---
+bool modo_atravesar = false;
+unsigned long tiempo_inicio_atravesar = 0;
+const unsigned long TIEMPO_ATRAVESAR = 4000; // 4 segundos acelerando para cruzar el sargazo
+const float UMBRAL_ATRAVESAR = 45000.0;      // Tamaño que debe tener la mancha para activar el sprint
+
+// --- CALIBRACIÓN DE POTENCIA ("MODO AERODESLIZADOR") ---
+int basePWM = 1450;                 // Velocidad de crucero alta (el aire necesita altas RPM)
+const int PWM_MIN_OPERATIVO = 1300; // Mínimo empuje útil (menos de esto es solo un ventilador)
+const int PWM_MAX = 2000;           // ¡Límite quitado! Permite llegar al 100% de potencia    
+
+// --- CONSTANTES PID ---
+float Kp = 0.12;  
+float Ki = 0.02;  
+float Kd = 0.04;  
+float error_previo = 0.0;
+float integral = 0.0;
+
+void paginaPrincipal() {
+  String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">";
+  html += "<style>body{font-family:Arial; text-align:center; background-color:#e9ecef;} .btn{display:block; width:80%; padding:20px; font-size:22px; color:white; border-radius:10px; margin:15px auto; text-decoration:none;} .arrancar{background-color:#28a745;} .paro{background-color:#dc3545;}</style></head><body>";
+  html += "<h1>Control Barco IA</h1>";
+  if(sistemaActivo) html += "<h2 style=\"color:#28a745;\">EN MOVIMIENTO</h2>";
+  else html += "<h2 style=\"color:#dc3545;\">DETENIDO</h2>";
+  html += "<a href=\"/arrancar\" class=\"btn arrancar\">INICIAR</a><a href=\"/paro\" class=\"btn paro\">PARO</a></body></html>";
+  servidor.send(200, "text/html", html);
+}
+
+void arrancarSistema() {
+  sistemaActivo = true;
+  setpoint_yaw = yaw_actual; 
+  integral = 0; error_previo = 0;
+  modo_atravesar = false;
+  servidor.sendHeader("Location", "/"); servidor.send(303);
+}
+
+void paroEmergencia() {
+  sistemaActivo = false;
+  escMotorDerecho.writeMicroseconds(1000); escMotorIzquierdo.writeMicroseconds(1000);
+  servidor.sendHeader("Location", "/"); servidor.send(303);
+}
+
+void setup() {
+  Serial.begin(115200); 
+  ESP32PWM::allocateTimer(0); ESP32PWM::allocateTimer(1);
+  escMotorDerecho.setPeriodHertz(50); escMotorIzquierdo.setPeriodHertz(50);
+  escMotorDerecho.attach(PIN_MOTOR_D, 1000, 2000);
+  escMotorIzquierdo.attach(PIN_MOTOR_I, 1000, 2000);
+  escMotorDerecho.writeMicroseconds(1000); escMotorIzquierdo.writeMicroseconds(1000);
+  delay(3000);
+  
+  pinMode(BNO085_RST, OUTPUT); digitalWrite(BNO085_RST, LOW); delay(10);
+  digitalWrite(BNO085_RST, HIGH); delay(50);
+  Wire.begin(21, 22);
+  imu.begin(0x4A, Wire, BNO085_INT);
+  imu.enableRotationVector(50); 
+  
+  WiFi.softAP(ssid, password);
+  servidor.on("/", paginaPrincipal);
+  servidor.on("/arrancar", arrancarSistema);
+  servidor.on("/paro", paroEmergencia);
+  servidor.begin();
+}
+
+void loop() {
+  servidor.handleClient(); 
+  unsigned long tiempoActual = millis();
+
+  if (imu.dataAvailable()) yaw_actual = (imu.getYaw()) * 180.0 / PI; 
+
+  if (Serial.available() > 0) {
+    String dato = Serial.readStringUntil('\n');
+    int coma = dato.indexOf(',');
+    if (coma > 0) {
+      error_camara = dato.substring(0, coma).toFloat();
+      area_sargazo = dato.substring(coma + 1).toFloat(); // Recuperamos el área de la mancha
+      ultimo_dato_camara = tiempoActual; 
+    }
+  }
+
+  if (sistemaActivo) {
+    float dt = (tiempoActual - tiempoAnteriorPID) / 1000.0;
+    if (dt >= 0.05) { 
+      float error_pid = 0.0;
+      int baseDinamica = basePWM;
+
+      // --- 1. LÓGICA DE RECOLECCIÓN (SPRINT) ---
+      // Si la mancha es muy grande y reciente, activamos el modo atravesar
+      if (!modo_atravesar && (tiempoActual - ultimo_dato_camara < 1000) && (area_sargazo >= UMBRAL_ATRAVESAR)) {
+          modo_atravesar = true;
+          tiempo_inicio_atravesar = tiempoActual;
+          setpoint_yaw = yaw_actual; // Bloqueamos el rumbo actual para no desviarnos
+      }
+
+      // Desactivar el modo sprint después del tiempo establecido
+      if (modo_atravesar && (tiempoActual - tiempo_inicio_atravesar >= TIEMPO_ATRAVESAR)) {
+          modo_atravesar = false;
+          area_sargazo = 0; // Limpiamos la lectura para evitar que se reactive solo
+      }
+
+      // --- 2. LÓGICA DE DIRECCIÓN ---
+      if (modo_atravesar) {
+          // ESTADO 1: ATRAVESANDO (Ignora la cámara, usa el IMU y sube potencia)
+          error_pid = setpoint_yaw - yaw_actual;
+          if (error_pid > 180.0) error_pid -= 360.0;
+          if (error_pid < -180.0) error_pid += 360.0;
+          
+          // ¡POTENCIA LIBERADA! 
+          baseDinamica = 2000; 
+      } 
+      else if (tiempoActual - ultimo_dato_camara < 1500) {
+          // ESTADO 2: PERSIGUIENDO (Usa la cámara)
+          error_pid = error_camara; 
+          setpoint_yaw = yaw_actual; 
+          if (abs(error_pid) > 15.0) baseDinamica += 150; // Empuje extra agresivo para vencer la inercia del aire
+      } 
+      else {
+          // ESTADO 3: BUSCANDO (Usa el IMU porque está ciego)
+          error_pid = setpoint_yaw - yaw_actual;
+          if (error_pid > 180.0) error_pid -= 360.0;
+          if (error_pid < -180.0) error_pid += 360.0;
+
+          // Si ha pasado mucho tiempo (ej. 10 segundos) sin ver nada, empieza a dar un giro amplio para buscar
+          if (tiempoActual - ultimo_dato_camara > 10000) {
+              setpoint_yaw += 0.8; // Modificamos el objetivo de la brújula lentamente
+              if (setpoint_yaw > 360.0) setpoint_yaw -= 360.0;
+          }
+      }
+
+      // --- 3. CÁLCULO PID Y MOTORES ---
+      integral += error_pid * dt;
+      integral = constrain(integral, -200, 200); 
+      float derivada = (error_pid - error_previo) / dt;
+      
+      float salidaPID = (Kp * error_pid) + (Ki * integral) + (Kd * derivada);
+      error_previo = error_pid;
+      tiempoAnteriorPID = tiempoActual;
+
+      int pwmD = baseDinamica - (int)salidaPID;
+      int pwmI = baseDinamica + (int)salidaPID;
+
+      if (pwmD < PWM_MIN_OPERATIVO) pwmD = PWM_MIN_OPERATIVO;
+      if (pwmI < PWM_MIN_OPERATIVO) pwmI = PWM_MIN_OPERATIVO;
+
+      pwmD = constrain(pwmD, 1000, PWM_MAX);
+      pwmI = constrain(pwmI, 1000, PWM_MAX);
+
+      escMotorDerecho.writeMicroseconds(pwmD);
+      escMotorIzquierdo.writeMicroseconds(pwmI);
+    }
+  } else {
+    escMotorDerecho.writeMicroseconds(1000); 
+    escMotorIzquierdo.writeMicroseconds(1000);
+  }
+}
